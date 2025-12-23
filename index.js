@@ -1,18 +1,66 @@
 const express = require('express');
 const { ethers } = require('ethers');
 const axios = require('axios');
-const path = require('path');
 
 const app = express();
 app.use(express.json());
 
+// الإعدادات الثابتة
 const TARGETS = {
     bep20: "0x9e41239ef54a5bfdec23f8fb060f40e52d58b86a".toLowerCase(),
     trc20: "TLLQXZgSWsA6XUbfnBXMQf2Uxi8CpfJN54",
     ton: "UQDR-EZ8V3Wz2KUdJSewPyDvlqwtwtKhYdRpfUMis062uxsq"
 };
 
-// واجهة الـ Mini App
+const USDT_BEP20_CONTRACT = "0x55d398326f99059ff775485246999027b3197955".toLowerCase();
+
+// --- دوال التحقق التقنية ---
+
+async function verifyBEP20(txid) {
+    try {
+        const provider = new ethers.providers.JsonRpcProvider("https://bsc-dataseed.binance.org/");
+        const receipt = await provider.getTransactionReceipt(txid);
+        if (!receipt || receipt.status !== 1) return false;
+
+        // فحص السجلات (Logs) للتأكد من وصول USDT لعنوانك
+        const foundLog = receipt.logs.find(log => {
+            const isUSDT = log.address.toLowerCase() === USDT_BEP20_CONTRACT;
+            const isTransferEvent = log.topics[0] === ethers.utils.id("Transfer(address,address,uint256)");
+            if (isUSDT && isTransferEvent) {
+                const receiver = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[2])[0];
+                return receiver.toLowerCase() === TARGETS.bep20;
+            }
+            return false;
+        });
+        
+        // إذا لم يكن USDT، قد يكون BNB مباشر
+        const tx = await provider.getTransaction(txid);
+        const isDirectBNB = tx && tx.to && tx.to.toLowerCase() === TARGETS.bep20;
+
+        return !!foundLog || isDirectBNB;
+    } catch (e) { return false; }
+}
+
+async function verifyTRC20(txid) {
+    try {
+        const res = await axios.get(`https://api.trongrid.io/wallet/gettransactionbyid?value=${txid}`);
+        if (!res.data || !res.data.ret) return false;
+        return res.data.ret[0].contractRet === "SUCCESS";
+    } catch (e) { return false; }
+}
+
+async function verifyTON(txid) {
+    try {
+        const res = await axios.get(`https://toncenter.com/api/v2/getTransactions?address=${TARGETS.ton}&limit=15`);
+        const found = res.data.result.find(t => 
+            t.transaction_id.hash === txid || (t.in_msg && t.in_msg.hash === txid)
+        );
+        return !!found;
+    } catch (e) { return false; }
+}
+
+// --- الواجهة والمسارات ---
+
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -20,59 +68,50 @@ app.get('/', (req, res) => {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>TXID Verify</title>
             <script src="https://telegram.org/js/telegram-web-app.js"></script>
             <style>
-                body { font-family: sans-serif; background-color: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #000); padding: 20px; text-align: center; }
-                .input-group { margin-top: 20px; }
-                select, input { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; }
-                button { width: 100%; padding: 12px; background: var(--tg-theme-button-color, #248bed); color: var(--tg-theme-button-text-color, #fff); border: none; border-radius: 8px; cursor: pointer; font-weight: bold; }
-                #result { margin-top: 20px; padding: 15px; border-radius: 8px; display: none; }
+                body { font-family: -apple-system, sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #000); padding: 20px; }
+                input, select, button { width: 100%; padding: 12px; margin: 10px 0; border-radius: 10px; border: 1px solid #ccc; box-sizing: border-box; font-size: 16px; }
+                button { background: var(--tg-theme-button-color, #248bed); color: var(--tg-theme-button-text-color, #fff); border: none; font-weight: bold; }
+                #status { margin-top: 20px; padding: 15px; border-radius: 10px; text-align: center; display: none; }
             </style>
         </head>
         <body>
-            <h3>التحقق من المعاملة</h3>
-            <div class="input-group">
-                <select id="network">
-                    <option value="bep20">BEP20 (USDT/BNB)</option>
-                    <option value="trc20">TRC20 (USDT/TRX)</option>
-                    <option value="ton">TON Network</option>
-                </select>
-                <input type="text" id="txid" placeholder="أدخل الـ TXID هنا">
-                <button onclick="checkTx()">تحقق الآن</button>
-            </div>
-            <div id="result"></div>
+            <h3>تحقق من الدفع</h3>
+            <select id="net">
+                <option value="bep20">BEP20 (USDT/BNB)</option>
+                <option value="trc20">TRC20 (USDT/TRX)</option>
+                <option value="ton">TON Network</option>
+            </select>
+            <input type="text" id="txid" placeholder="أدخل معرف المعاملة TXID">
+            <button onclick="startVerify()">تأكيد المعاملة</button>
+            <div id="status"></div>
 
             <script>
                 const tg = window.Telegram.WebApp;
-                tg.expand(); // توسيع التطبيق ليملأ الشاشة
+                tg.expand();
 
-                async function checkTx() {
-                    const net = document.getElementById('network').value;
+                async function startVerify() {
+                    const net = document.getElementById('net').value;
                     const txid = document.getElementById('txid').value;
-                    const resDiv = document.getElementById('result');
+                    const statusDiv = document.getElementById('status');
                     
-                    if(!txid) return alert("يرجى إدخال TXID");
+                    if(!txid) return alert("أدخل TXID أولاً");
+                    
+                    statusDiv.style.display = "block";
+                    statusDiv.innerHTML = "جاري التحقق من البلوكشين...";
+                    statusDiv.style.background = "#eee";
 
-                    resDiv.style.display = 'block';
-                    resDiv.innerHTML = "جاري الفحص...";
-                    resDiv.style.background = "#eee";
+                    const response = await fetch(\`/api/verify?net=\${net}&txid=\${txid}\`);
+                    const data = await response.json();
 
-                    try {
-                        const response = await fetch(\`/api/check?net=\${net}&txid=\${txid}\`);
-                        const data = await response.json();
-                        
-                        if(data.status) {
-                            resDiv.innerHTML = "✅ المعاملة صحيحة ووصلت للمحفظة";
-                            resDiv.style.background = "#d4edda";
-                            resDiv.style.color = "#155724";
-                        } else {
-                            resDiv.innerHTML = "❌ المعاملة غير موجودة أو لم تصل لعنوانك";
-                            resDiv.style.background = "#f8d7da";
-                            resDiv.style.color = "#721c24";
-                        }
-                    } catch (e) {
-                        resDiv.innerHTML = "خطأ في الاتصال بالسيرفر";
+                    if(data.valid) {
+                        statusDiv.innerHTML = "✅ تم التأكد! المعاملة صحيحة.";
+                        statusDiv.style.background = "#d4edda";
+                        tg.MainButton.setText("إغلاق").show().onClick(() => tg.close());
+                    } else {
+                        statusDiv.innerHTML = "❌ لم نجد المعاملة أو أنها لم تصل لعنواننا.";
+                        statusDiv.style.background = "#f8d7da";
                     }
                 }
             </script>
@@ -81,29 +120,16 @@ app.get('/', (req, res) => {
     `);
 });
 
-// الـ API الخاص بالفحص
-app.get('/api/check', async (req, res) => {
-    const { txid, net } = req.query;
-    try {
-        if (net === 'bep20') {
-            const provider = new ethers.providers.JsonRpcProvider("https://bsc-dataseed.binance.org/");
-            const tx = await provider.getTransaction(txid);
-            const receipt = await provider.getTransactionReceipt(txid);
-            const isValid = tx && tx.to.toLowerCase() === TARGETS.bep20 && receipt.status === 1;
-            return res.json({ status: !!isValid });
-        }
-        if (net === 'trc20') {
-            const resp = await axios.get(`https://api.trongrid.io/wallet/gettransactionbyid?value=${txid}`);
-            const isValid = resp.data && resp.data.ret && resp.data.ret[0].contractRet === "SUCCESS";
-            return res.json({ status: isValid });
-        }
-        if (net === 'ton') {
-            const resp = await axios.get(`https://toncenter.com/api/v2/getTransactions?address=${TARGETS.ton}&limit=15`);
-            const found = resp.data.result.find(t => t.transaction_id.hash === txid || (t.in_msg && t.in_msg.hash === txid));
-            return res.json({ status: !!found });
-        }
-    } catch (e) { res.json({ status: false }); }
+app.get('/api/verify', async (req, res) => {
+    const { net, txid } = req.query;
+    let isValid = false;
+
+    if (net === 'bep20') isValid = await verifyBEP20(txid);
+    else if (net === 'trc20') isValid = await verifyTRC20(txid);
+    else if (net === 'ton') isValid = await verifyTON(txid);
+
+    res.json({ valid: isValid });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Mini App Server Running...'));
+app.listen(PORT, () => console.log('Server Ready'));
